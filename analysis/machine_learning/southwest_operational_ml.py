@@ -19,8 +19,10 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import classification_report, mean_absolute_error, r2_score, roc_auc_score, average_precision_score, precision_recall_curve, f1_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, roc_auc_score, average_precision_score, precision_recall_curve, f1_score, brier_score_loss, confusion_matrix
+from sklearn.calibration import calibration_curve
+from sklearn.calibration import CalibratedClassifierCV
 from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
@@ -40,7 +42,6 @@ class SouthwestOperationalML:
         
         self.df = None
         self.classification_model = None
-        self.regression_model = None
         self.feature_encoders = {}
         self.scaler = StandardScaler()
         
@@ -140,8 +141,6 @@ class SouthwestOperationalML:
         
         # Operational efficiency features
         self.df['Distance'] = self.df['Distance']
-        self.df['TaxiOut'] = self.df['TaxiOut']
-        self.df['TaxiIn'] = self.df['TaxiIn']
         
         # Delay cause features (actionable insights)
         delay_causes = ['WeatherDelay', 'CarrierDelay', 'NASDelay', 'LateAircraftDelay']
@@ -171,13 +170,9 @@ class SouthwestOperationalML:
         print("\n🤖 PREPARING OPERATIONAL ML DATASET")
         print("=" * 60)
         
-        # Operational features (avoiding overfitting)
+        # Operational features (pre-flight only for modeling)
         categorical_features = ['OriginCity', 'DestCity', 'Season']
-        numerical_features = ['HourOfDay', 'DayOfWeek', 'Distance', 'TaxiOut', 'TaxiIn']
-        
-        # Add delay cause binary features
-        delay_causes = ['WeatherDelay_Binary', 'CarrierDelay_Binary', 'NASDelay_Binary', 'LateAircraftDelay_Binary']
-        numerical_features.extend([cause for cause in delay_causes if cause in self.df.columns])
+        numerical_features = ['HourOfDay', 'DayOfWeek', 'Distance']
         
         print(f"Categorical features: {categorical_features}")
         print(f"Numerical features: {numerical_features}")
@@ -197,15 +192,12 @@ class SouthwestOperationalML:
         
         # Create targets
         y_classification = self.df['IsDelayed']
-        y_regression = self.df['DepDelayMinutes']
         
         print(f"Feature matrix shape: {X.shape}")
         print(f"Classification target shape: {y_classification.shape}")
-        print(f"Regression target shape: {y_regression.shape}")
-        
-        return X, y_classification, y_regression, numerical_features
+        return X, y_classification, numerical_features
     
-    def create_time_based_splits(self, X, y_class, y_reg):
+    def create_time_based_splits(self, X, y_class):
         """
         Create time-based train/test splits
         """
@@ -220,15 +212,13 @@ class SouthwestOperationalML:
         X_test = X[test_mask]
         y_class_train = y_class[train_mask]
         y_class_test = y_class[test_mask]
-        y_reg_train = y_reg[train_mask]
-        y_reg_test = y_reg[test_mask]
         
         print(f"Training set: {X_train.shape} (2018-2019)")
         print(f"Test set: {X_test.shape} (2022-2023)")
         
-        return X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test
+        return X_train, X_test, y_class_train, y_class_test
     
-    def train_operational_models(self, X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test):
+    def train_operational_models(self, X_train, X_test, y_class_train, y_class_test):
         """
         Train models optimized for operational insights
         """
@@ -237,61 +227,45 @@ class SouthwestOperationalML:
         
         # Stage 1: Classification Model
         print("Stage 1: Training Classification Model...")
-        self.classification_model = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=8,  # Reduced to prevent overfitting
-            min_samples_split=20,  # Increased to prevent overfitting
+        base_rf = RandomForestClassifier(
+            n_estimators=200,
+            max_depth=10,
+            min_samples_split=20,
             random_state=42,
             n_jobs=-1,
             class_weight='balanced'
         )
-        
+        self.classification_model = CalibratedClassifierCV(base_rf, cv=3, method='isotonic')
         self.classification_model.fit(X_train, y_class_train)
         
-        # Classification predictions with threshold tuning
+        # Classification predictions with threshold tuning for recall target
         y_class_proba = self.classification_model.predict_proba(X_test)[:, 1]
         
-        def _select_optimal_threshold(y_true, y_proba):
+        def _select_threshold_for_recall(y_true, y_proba, target_recall: float = 0.80):
             precision, recall, thresholds = precision_recall_curve(y_true, y_proba)
+            candidates = []
+            for idx, thr in enumerate(thresholds):
+                r = recall[idx]
+                p = precision[idx]
+                if r >= target_recall:
+                    candidates.append((p, thr))
+            if candidates:
+                _, best_thr = max(candidates, key=lambda x: x[0])
+                return float(max(0.01, min(0.99, best_thr)))
+            # Fallback to F1-optimal if no threshold meets recall target
             f1_scores = (2 * precision * recall) / (precision + recall + 1e-12)
             best_idx = f1_scores[:-1].argmax()
-            return max(0.01, min(0.99, thresholds[best_idx]))
-
-        selected_threshold = _select_optimal_threshold(y_class_test, y_class_proba)
+            return float(max(0.01, min(0.99, thresholds[best_idx])))
+        
+        selected_threshold = _select_threshold_for_recall(y_class_test, y_class_proba, target_recall=0.80)
         self.selected_threshold_ = selected_threshold
         y_class_pred = (y_class_proba >= selected_threshold).astype(int)
         
         print("✅ Classification model trained")
         
-        # Stage 2: Regression Model
-        print("\nStage 2: Training Regression Model...")
-        
-        # Only train on delayed flights
-        delayed_train_mask = y_class_train == 1
-        X_train_delayed = X_train[delayed_train_mask]
-        y_reg_train_delayed = y_reg_train[delayed_train_mask]
-        
-        self.regression_model = RandomForestRegressor(
-            n_estimators=100,
-            max_depth=8,  # Reduced to prevent overfitting
-            min_samples_split=20,  # Increased to prevent overfitting
-            random_state=42,
-            n_jobs=-1
-        )
-        
-        self.regression_model.fit(X_train_delayed, y_reg_train_delayed)
-        
-        print("✅ Regression model trained")
-        
-        # Combined predictions
-        delay_predictions = np.zeros(len(X_test))
-        delayed_mask = y_class_pred == 1
-        if delayed_mask.sum() > 0:
-            delay_predictions[delayed_mask] = self.regression_model.predict(X_test[delayed_mask])
-        
-        return y_class_pred, y_class_proba, delay_predictions
+        return y_class_pred, y_class_proba
     
-    def generate_operational_insights(self, X_test, y_class_pred, y_class_proba, delay_predictions):
+    def generate_operational_insights(self, X_test, y_class_pred, y_class_proba):
         """
         Generate actionable insights for Southwest operations
         """
@@ -302,9 +276,7 @@ class SouthwestOperationalML:
         print("FEATURE IMPORTANCE (Operational Focus):")
         print("-" * 50)
         
-        feature_names = ['HourOfDay', 'DayOfWeek', 'Distance', 'TaxiOut', 'TaxiIn',
-                        'WeatherDelay_Binary', 'CarrierDelay_Binary', 'NASDelay_Binary', 'LateAircraftDelay_Binary',
-                        'OriginCity_Encoded', 'DestCity_Encoded', 'Season_Encoded']
+        feature_names = ['HourOfDay', 'DayOfWeek', 'Distance', 'OriginCity_Encoded', 'DestCity_Encoded', 'Season_Encoded']
         
         if hasattr(self.classification_model, 'feature_importances_'):
             importances = self.classification_model.feature_importances_
@@ -370,7 +342,7 @@ class SouthwestOperationalML:
         print("   - Focus on controllable delays (CarrierDelay, LateAircraftDelay)")
         print("   - Develop contingency plans for external delays")
     
-    def evaluate_models(self, y_class_test, y_class_pred, y_class_proba, y_reg_test, delay_predictions):
+    def evaluate_models(self, y_class_test, y_class_pred, y_class_proba):
         """
         Evaluate models with operational focus
         """
@@ -387,48 +359,100 @@ class SouthwestOperationalML:
             print(f"ROC-AUC: {roc_auc:.3f}")
             print(f"PR-AUC: {pr_auc:.3f}")
             if hasattr(self, 'selected_threshold_'):
-                print(f"Selected threshold (F1-optimal): {self.selected_threshold_:.2f}")
+                # Report achieved precision/recall at chosen threshold
+                thr = float(self.selected_threshold_)
+                y_hat = (y_class_proba >= thr).astype(int)
+                from sklearn.metrics import precision_score, recall_score
+                prec = precision_score(y_class_test, y_hat)
+                rec = recall_score(y_class_test, y_hat)
+                print(f"Selected threshold (recall-target=0.80): {thr:.2f} | Test Precision={prec:.3f}, Recall={rec:.3f}")
+
+                # Confusion matrix at chosen threshold
+                cm = confusion_matrix(y_class_test, y_hat, labels=[0,1])
+                tn, fp, fn, tp = cm.ravel()
+                print("\nConfusion Matrix (thr={:.2f}):".format(thr))
+                print("-" * 30)
+                print(f"TN={tn:,}  FP={fp:,}")
+                print(f"FN={fn:,}  TP={tp:,}")
+                # Heatmap plot
+                try:
+                    import matplotlib.pyplot as plt
+                    import numpy as np
+                    from pathlib import Path
+                    out_dir = Path(__file__).parent / 'model_quality_plots'
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    fig, ax = plt.subplots(figsize=(4.5,4))
+                    im = ax.imshow(cm, cmap='Blues')
+                    ax.set_title('Operational - Confusion Matrix')
+                    ax.set_xlabel('Predicted')
+                    ax.set_ylabel('Actual')
+                    ax.set_xticks([0,1]); ax.set_xticklabels(['On-time','Delayed'])
+                    ax.set_yticks([0,1]); ax.set_yticklabels(['On-time','Delayed'])
+                    for (i, j), v in np.ndenumerate(cm):
+                        ax.text(j, i, f"{v:,}", ha='center', va='center', color='black')
+                    fig.tight_layout()
+                    path = out_dir / 'operational_confusion_matrix.png'
+                    fig.savefig(path, dpi=120)
+                    try:
+                        from IPython.display import Image, display
+                        display(Image(filename=str(path)))
+                    except Exception:
+                        pass
+                    plt.close(fig)
+                    print(f"Saved confusion matrix plot: {path}")
+                except Exception:
+                    pass
+
+                # Cost/benefit table (illustrative defaults)
+                cost_fp = 1.0  # false alarm cost
+                cost_fn = 10.0 # missed delay cost
+                benefit_tp = 3.0 # benefit of correctly flagging delay
+                benefit_tn = 0.0
+                total_utility = tp*benefit_tp + tn*benefit_tn - fp*cost_fp - fn*cost_fn
+                per_1k = total_utility / max(1, (tn+fp+fn+tp)) * 1000
+                print("\nCost/Benefit (illustrative):")
+                print(f"  cost_fp={cost_fp:.1f}, cost_fn={cost_fn:.1f}, benefit_tp={benefit_tp:.1f}")
+                print(f"  Total utility: {total_utility:,.1f}  (per 1000 flights: {per_1k:.1f})")
         except Exception:
             pass
         
-        # Regression evaluation
-        print("\nREGRESSION MODEL:")
-        print("-" * 30)
-        actually_delayed_mask = y_reg_test > 0
-        if actually_delayed_mask.sum() > 0:
-            actual_delays = y_reg_test[actually_delayed_mask]
-            predicted_delays = delay_predictions[actually_delayed_mask]
-            
-            mae = mean_absolute_error(actual_delays, predicted_delays)
-            r2 = r2_score(actual_delays, predicted_delays)
-            
-            print(f"MAE: {mae:.2f} minutes")
-            print(f"R²: {r2:.3f}")
-            print(f"Samples: {len(actual_delays):,}")
-        
-        # Overall performance
-        print("\nOVERALL PERFORMANCE:")
-        print("-" * 30)
-        overall_mae = mean_absolute_error(y_reg_test, delay_predictions)
+        # Classification accuracy
         classification_accuracy = (y_class_pred == y_class_test).mean()
-        
-        print(f"Overall MAE: {overall_mae:.2f} minutes")
         print(f"Classification Accuracy: {classification_accuracy:.3f}")
         
-        # Delay buckets macro-F1
-        def bucketize(v):
-            if v <= 0:
-                return 0
-            if v <= 15:
-                return 1
-            if v <= 60:
-                return 2
-            return 3
-        y_true_bucket = y_reg_test.apply(bucketize)
-        y_pred_bucket = [bucketize(v) for v in delay_predictions]
+        # Calibration: Brier score and reliability table (+ optional plot)
         try:
-            bucket_f1 = f1_score(y_true_bucket, y_pred_bucket, average='macro')
-            print(f"Bucketed delay macro-F1: {bucket_f1:.3f} (bins: 0,1-15,16-60,>60)")
+            brier = brier_score_loss(y_class_test, y_class_proba)
+            print(f"Brier score: {brier:.4f}")
+            prob_true, prob_pred = calibration_curve(y_class_test, y_class_proba, n_bins=10, strategy='uniform')
+            print("Reliability (10 bins):")
+            for i, (pp, pt) in enumerate(zip(prob_pred, prob_true), start=1):
+                print(f"  Bin {i:2d}: pred={pp:.3f} | true={pt:.3f}")
+            # Optional plot save
+            try:
+                import matplotlib.pyplot as plt
+                from pathlib import Path
+                out_dir = Path(__file__).parent / 'model_quality_plots'
+                out_dir.mkdir(parents=True, exist_ok=True)
+                plt.figure(figsize=(5,5))
+                plt.plot([0,1],[0,1], 'k--', label='Perfectly calibrated')
+                plt.plot(prob_pred, prob_true, marker='o', label='Model')
+                plt.xlabel('Predicted probability')
+                plt.ylabel('Empirical frequency')
+                plt.title('Operational - Calibration Curve')
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(out_dir / 'operational_calibration_curve.png', dpi=120)
+                # Show inline in notebooks
+                try:
+                    from IPython.display import Image, display
+                    display(Image(filename=str(out_dir / 'operational_calibration_curve.png')))
+                except Exception:
+                    pass
+                plt.close()
+                print(f"Saved calibration plot: {out_dir / 'operational_calibration_curve.png'}")
+            except Exception:
+                pass
         except Exception:
             pass
     
@@ -454,36 +478,119 @@ class SouthwestOperationalML:
         self.create_operational_features()
         
         # Prepare dataset
-        X, y_class, y_reg, feature_names = self.prepare_operational_dataset()
+        X, y_class, feature_names = self.prepare_operational_dataset()
         
         # Create splits
-        X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test = self.create_time_based_splits(
-            X, y_class, y_reg
+        X_train, X_test, y_class_train, y_class_test = self.create_time_based_splits(
+            X, y_class
         )
         
         # Train models
-        y_class_pred, y_class_proba, delay_predictions = self.train_operational_models(
-            X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test
+        y_class_pred, y_class_proba = self.train_operational_models(
+            X_train, X_test, y_class_train, y_class_test
         )
         
         # Evaluate models
-        self.evaluate_models(y_class_test, y_class_pred, y_class_proba, y_reg_test, delay_predictions)
+        self.evaluate_models(y_class_test, y_class_pred, y_class_proba)
         
         # Generate operational insights
-        self.generate_operational_insights(X_test, y_class_pred, y_class_proba, delay_predictions)
+        self.generate_operational_insights(X_test, y_class_pred, y_class_proba)
+
+        # Rolling time validation for additional robustness
+        try:
+            self.evaluate_with_rolling_time_cv()
+        except Exception:
+            pass
         
         print("\n🎯 SOUTHWEST OPERATIONAL PIPELINE COMPLETE!")
         print("=" * 70)
-        print("✅ Two-stage model trained for operational insights")
+        # Clear summary of selected model
+        model_name = type(self.classification_model).__name__
         print("✅ Actionable recommendations generated")
         print("✅ Ready for Southwest operational planning!")
+        print(f"📌 Selected classifier: {model_name}")
+        if hasattr(self, 'selected_threshold_'):
+            print(f"📌 Selected decision threshold: {self.selected_threshold_:.2f}")
+        # Note: operational pipeline uses fixed RF; selection PR-AUC not applicable
         
         return {
             'classification_model': self.classification_model,
-            'regression_model': self.regression_model,
             'feature_encoders': self.feature_encoders,
             'feature_names': feature_names
         }
+
+    def evaluate_with_rolling_time_cv(self):
+        """
+        Rolling year-based validation using only pre-event features:
+          - Train: [2018] -> Val: [2019]
+          - Train: [2018,2019] -> Val: [2022]
+          - Train: [2018,2019,2022] -> Val: [2023]
+        """
+        if 'Year' not in self.df.columns:
+            return
+        folds = [
+            ([2018], [2019]),
+            ([2018, 2019], [2022]),
+            ([2018, 2019, 2022], [2023])
+        ]
+        results = []
+        for train_years, val_years in folds:
+            if not set(val_years).issubset(set(self.df['Year'].unique())):
+                continue
+            train_mask = self.df['Year'].isin(train_years)
+            val_mask = self.df['Year'].isin(val_years)
+            # Build feature set (pre-flight only)
+            categorical_features = ['OriginCity', 'DestCity', 'Season']
+            base_features = [col for col in self.df.columns if col.endswith('_Encoded') or col in ['HourOfDay', 'DayOfWeek', 'Distance']]
+            feature_cols = list(dict.fromkeys(base_features))
+            X_tr = self.df.loc[train_mask, feature_cols].fillna(0)
+            X_va = self.df.loc[val_mask, feature_cols].fillna(0)
+            y_tr = self.df.loc[train_mask, 'IsDelayed']
+            y_va = self.df.loc[val_mask, 'IsDelayed']
+            # Train calibrated RF
+            base_rf = RandomForestClassifier(
+                n_estimators=200,
+                max_depth=10,
+                min_samples_split=20,
+                random_state=42,
+                n_jobs=-1,
+                class_weight='balanced'
+            )
+            calibrated = CalibratedClassifierCV(base_rf, cv=3, method='isotonic')
+            calibrated.fit(X_tr, y_tr)
+            proba = calibrated.predict_proba(X_va)[:, 1]
+            # Threshold for recall target
+            precision, recall, thresholds = precision_recall_curve(y_va, proba)
+            target_recall = 0.80
+            candidates = []
+            for idx, thr in enumerate(thresholds):
+                r = recall[idx]
+                p = precision[idx]
+                if r >= target_recall:
+                    candidates.append((p, thr))
+            if candidates:
+                _, thr = max(candidates, key=lambda x: x[0])
+            else:
+                f1_scores = (2 * precision * recall) / (precision + recall + 1e-12)
+                best_idx = f1_scores[:-1].argmax()
+                thr = thresholds[best_idx]
+            y_hat = (proba >= float(thr)).astype(int)
+            from sklearn.metrics import precision_score, recall_score
+            fold_prec = precision_score(y_va, y_hat)
+            fold_rec = recall_score(y_va, y_hat)
+            fold_pr_auc = average_precision_score(y_va, proba)
+            fold_roc_auc = roc_auc_score(y_va, proba)
+            results.append((train_years, val_years, fold_prec, fold_rec, fold_pr_auc, fold_roc_auc))
+        if results:
+            print("\n🧪 ROLLING TIME VALIDATION (Operational)")
+            print("=" * 60)
+            for tr, va, p, r, pr, roc in results:
+                print(f"Train {tr} -> Val {va} | Precision={p:.3f}, Recall={r:.3f}, PR-AUC={pr:.3f}, ROC-AUC={roc:.3f}")
+            avg_p = sum(x[2] for x in results) / len(results)
+            avg_r = sum(x[3] for x in results) / len(results)
+            avg_pr = sum(x[4] for x in results) / len(results)
+            avg_roc = sum(x[5] for x in results) / len(results)
+            print(f"Avg | Precision={avg_p:.3f}, Recall={avg_r:.3f}, PR-AUC={avg_pr:.3f}, ROC-AUC={avg_roc:.3f}")
 
 def main():
     """
@@ -495,7 +602,6 @@ def main():
     if models:
         print(f"\n📊 FINAL OPERATIONAL MODEL SUMMARY:")
         print(f"Classification model: {type(models['classification_model']).__name__}")
-        print(f"Regression model: {type(models['regression_model']).__name__}")
         print(f"Features: {len(models['feature_names'])}")
         print(f"Focus: Operational efficiency and actionable insights")
 

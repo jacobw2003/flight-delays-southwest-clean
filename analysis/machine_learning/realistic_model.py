@@ -11,7 +11,7 @@ This script creates a realistic model using only features available BEFORE fligh
 
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, r2_score, mean_absolute_error, roc_auc_score, average_precision_score, precision_recall_curve, f1_score
 from sklearn.model_selection import train_test_split
@@ -35,7 +35,6 @@ class RealisticSouthwestModel:
         
         self.df = None
         self.classification_model = None
-        self.regression_model = None
         self.bucket_classifier = None
         self.feature_encoders = {}
         self.y_bucket = None
@@ -139,8 +138,7 @@ class RealisticSouthwestModel:
         
         # Create targets
         y_classification = self.df['IsDelayed']
-        y_regression = self.df['DepDelayMinutes']
-        # Create delay buckets for multiclass classification (primary output)
+        # Create delay buckets for optional multiclass classification (secondary)
         def bucketize_minutes(v: float) -> int:
             if v <= 0:
                 return 0
@@ -149,15 +147,13 @@ class RealisticSouthwestModel:
             if v <= 60:
                 return 2
             return 3
-        self.y_bucket = y_regression.apply(bucketize_minutes)
+        self.y_bucket = self.df['DepDelayMinutes'].apply(bucketize_minutes)
         
         print(f"Feature matrix shape: {X.shape}")
         print(f"Classification target shape: {y_classification.shape}")
-        print(f"Regression target shape: {y_regression.shape}")
-        
-        return X, y_classification, y_regression, numerical_features
+        return X, y_classification, numerical_features
     
-    def create_time_based_splits(self, X, y_class, y_reg):
+    def create_time_based_splits(self, X, y_class):
         """
         Create time-based train/test splits
         """
@@ -168,15 +164,15 @@ class RealisticSouthwestModel:
         # In production, you would use time-based splits
         from sklearn.model_selection import train_test_split
         
-        X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test = train_test_split(
-            X, y_class, y_reg, test_size=0.2, random_state=42
+        X_train, X_test, y_class_train, y_class_test = train_test_split(
+            X, y_class, test_size=0.2, random_state=42, stratify=y_class
         )
         
         print(f"Training set: {X_train.shape}")
         print(f"Test set: {X_test.shape}")
         print("Note: Using random split due to limited year data in sample")
         
-        return X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test
+        return X_train, X_test, y_class_train, y_class_test
     
     def _select_classifier(self, X_train, y_train):
         """
@@ -258,6 +254,11 @@ class RealisticSouthwestModel:
                     best_model = est
             except Exception:
                 continue
+        try:
+            self.selected_classifier_name = type(best_model).__name__
+            self.selected_classifier_pr_auc = float(best_pr_auc)
+        except Exception:
+            pass
         print(f"Selected classifier: {type(best_model).__name__} (PR-AUC val={best_pr_auc:.3f})")
         return best_model
 
@@ -284,7 +285,7 @@ class RealisticSouthwestModel:
         best_idx = f1_scores[:-1].argmax()
         return float(max(0.01, min(0.99, thresholds[best_idx])))
 
-    def train_realistic_models(self, X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test):
+    def train_realistic_models(self, X_train, X_test, y_class_train, y_class_test):
         """
         Train realistic models
         """
@@ -312,25 +313,8 @@ class RealisticSouthwestModel:
         
         print("✅ Classification model trained")
         
-        # Regression model (only on delayed flights)
-        print("\nTraining Regression Model...")
-        delayed_train_mask = y_class_train == 1
-        X_train_delayed = X_train[delayed_train_mask]
-        y_reg_train_delayed = y_reg_train[delayed_train_mask]
-        
-        self.regression_model = RandomForestRegressor(
-            n_estimators=100,
-            max_depth=10,
-            min_samples_split=20,
-            random_state=42,
-            n_jobs=-1
-        )
-        self.regression_model.fit(X_train_delayed, y_reg_train_delayed)
-        
-        print("✅ Regression model trained")
-
-        # Multiclass delay-bucket classifier (primary output)
-        print("\nTraining Delay-Bucket Classifier (primary output)...")
+        # Optional: Multiclass delay-bucket classifier (secondary output)
+        print("\nTraining Delay-Bucket Classifier (secondary output)...")
         # Align bucket targets with train/test indices
         y_bucket_train = self.y_bucket.loc[X_train.index]
         y_bucket_test = self.y_bucket.loc[X_test.index]
@@ -346,15 +330,9 @@ class RealisticSouthwestModel:
         self._last_bucket_true_ = y_bucket_test
         self._last_bucket_pred_ = y_bucket_pred
         
-        # Combined predictions
-        delay_predictions = np.zeros(len(X_test))
-        delayed_mask = y_class_pred == 1
-        if delayed_mask.sum() > 0:
-            delay_predictions[delayed_mask] = self.regression_model.predict(X_test[delayed_mask])
-        
-        return y_class_pred, y_class_proba, delay_predictions
+        return y_class_pred, y_class_proba
     
-    def evaluate_realistic_models(self, y_class_test, y_class_pred, y_class_proba, y_reg_test, delay_predictions):
+    def evaluate_realistic_models(self, y_class_test, y_class_pred, y_class_proba):
         """
         Evaluate realistic models
         """
@@ -382,29 +360,8 @@ class RealisticSouthwestModel:
             pass
         
         # Regression evaluation
-        print("\nREGRESSION MODEL:")
-        print("-" * 30)
-        actually_delayed_mask = y_reg_test > 0
-        if actually_delayed_mask.sum() > 0:
-            actual_delays = y_reg_test[actually_delayed_mask]
-            predicted_delays = delay_predictions[actually_delayed_mask]
-            
-            mae = mean_absolute_error(actual_delays, predicted_delays)
-            r2 = r2_score(actual_delays, predicted_delays)
-            
-            print(f"MAE: {mae:.2f} minutes")
-            print(f"R²: {r2:.3f}")
-            print(f"Samples: {len(actual_delays):,}")
-        
-        # Overall performance (note: regression is de-prioritized)
-        print("\nOVERALL PERFORMANCE:")
-        print("-" * 30)
-        overall_mae = mean_absolute_error(y_reg_test, delay_predictions)
-        overall_r2 = r2_score(y_reg_test, delay_predictions)
+        # Classification accuracy
         classification_accuracy = (y_class_pred == y_class_test).mean()
-        
-        print(f"Overall MAE: {overall_mae:.2f} minutes")
-        print(f"Overall R²: {overall_r2:.3f}")
         print(f"Classification Accuracy: {classification_accuracy:.3f}")
         
         # Delay-bucket classifier evaluation (PRIMARY)
@@ -420,9 +377,9 @@ class RealisticSouthwestModel:
         except Exception:
             pass
         
-        return overall_r2, overall_mae, classification_accuracy
+        return classification_accuracy
     
-    def analyze_realistic_insights(self, X_test, y_class_pred, y_class_proba, delay_predictions):
+    def analyze_realistic_insights(self, X_test, y_class_pred, y_class_proba):
         """
         Analyze realistic insights
         """
@@ -493,37 +450,40 @@ class RealisticSouthwestModel:
         self.create_realistic_features()
         
         # Prepare dataset
-        X, y_class, y_reg, feature_names = self.prepare_realistic_dataset()
+        X, y_class, feature_names = self.prepare_realistic_dataset()
         
         # Create splits
-        X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test = self.create_time_based_splits(
-            X, y_class, y_reg
+        X_train, X_test, y_class_train, y_class_test = self.create_time_based_splits(
+            X, y_class
         )
         
         # Train models
-        y_class_pred, y_class_proba, delay_predictions = self.train_realistic_models(
-            X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test
+        y_class_pred, y_class_proba = self.train_realistic_models(
+            X_train, X_test, y_class_train, y_class_test
         )
         
         # Evaluate models
-        overall_r2, overall_mae, classification_accuracy = self.evaluate_realistic_models(
-            y_class_test, y_class_pred, y_class_proba, y_reg_test, delay_predictions
+        classification_accuracy = self.evaluate_realistic_models(
+            y_class_test, y_class_pred, y_class_proba
         )
         
         # Analyze insights
-        self.analyze_realistic_insights(X_test, y_class_pred, y_class_proba, delay_predictions)
+        self.analyze_realistic_insights(X_test, y_class_pred, y_class_proba)
         
         print("\n🎯 REALISTIC ANALYSIS COMPLETE!")
         print("=" * 70)
-        print(f"✅ Realistic R²: {overall_r2:.3f}")
-        print(f"✅ Realistic MAE: {overall_mae:.2f} minutes")
+        # Clear summary of selected model
+        model_name = getattr(self, 'selected_classifier_name', type(self.classification_model).__name__)
         print(f"✅ Classification Accuracy: {classification_accuracy:.3f}")
+        print(f"📌 Selected classifier: {model_name}")
+        if hasattr(self, 'selected_threshold_'):
+            print(f"📌 Selected decision threshold: {self.selected_threshold_:.2f}")
+        if hasattr(self, 'selected_classifier_pr_auc'):
+            print(f"📌 Validation PR-AUC (selection): {self.selected_classifier_pr_auc:.3f}")
         print(f"✅ No data leakage - only pre-flight features")
         print(f"✅ Ready for realistic operational use!")
         
         return {
-            'r2': overall_r2,
-            'mae': overall_mae,
             'classification_accuracy': classification_accuracy,
             'feature_names': feature_names
         }

@@ -17,8 +17,9 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import classification_report, mean_absolute_error, r2_score, roc_auc_score, average_precision_score, precision_recall_curve, f1_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, roc_auc_score, average_precision_score, precision_recall_curve, f1_score, brier_score_loss, confusion_matrix
+from sklearn.calibration import calibration_curve
 from sklearn.calibration import CalibratedClassifierCV
 from pathlib import Path
 import warnings
@@ -39,7 +40,6 @@ class ConsumerMLPipeline:
         
         self.df = None
         self.classification_model = None
-        self.regression_model = None
         self.feature_encoders = {}
         # No scaler needed for tree-based models in this pipeline
         
@@ -122,13 +122,12 @@ class ConsumerMLPipeline:
         
         # Targets (features will be assembled after leakage-safe priors)
         y_classification = self.df['IsDelayed']  # Binary: delayed or not
-        y_regression = self.df['DepDelayMinutes']  # Continuous: delay minutes
         
         print(f"Prepared targets. Base numeric features: {len(numerical_features)}")
         
-        return None, y_classification, y_regression, numerical_features
+        return None, y_classification, numerical_features
     
-    def create_time_based_splits(self, X, y_class, y_reg):
+    def create_time_based_splits(self, X, y_class):
         """
         Create time-based train/test splits
         """
@@ -152,8 +151,6 @@ class ConsumerMLPipeline:
         X_test = self.df.loc[test_mask, feature_cols].fillna(0)
         y_class_train = y_class[train_mask]
         y_class_test = y_class[test_mask]
-        y_reg_train = y_reg[train_mask]
-        y_reg_test = y_reg[test_mask]
         
         print(f"Training set: {X_train.shape} (2018-2019)")
         print(f"Test set: {X_test.shape} (2022-2023)")
@@ -164,15 +161,7 @@ class ConsumerMLPipeline:
         print(f"  Training - Delayed: {y_class_train.sum():,} ({(y_class_train.sum()/len(y_class_train)*100):.1f}%)")
         print(f"  Test - Delayed: {y_class_test.sum():,} ({(y_class_test.sum()/len(y_class_test)*100):.1f}%)")
         
-        # Regression split statistics (only for delayed flights)
-        delayed_train = y_reg_train[y_class_train == 1]
-        delayed_test = y_reg_test[y_class_test == 1]
-        
-        print(f"\nRegression targets (delayed flights only):")
-        print(f"  Training - Avg delay: {delayed_train.mean():.1f} min ({len(delayed_train):,} flights)")
-        print(f"  Test - Avg delay: {delayed_test.mean():.1f} min ({len(delayed_test):,} flights)")
-        
-        return X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test
+        return X_train, X_test, y_class_train, y_class_test
 
     def _add_leakage_safe_priors(self, train_mask):
         try:
@@ -196,97 +185,54 @@ class ConsumerMLPipeline:
         except Exception:
             pass
     
-    def train_two_stage_model(self, X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test):
+    def train_classification_model(self, X_train, X_test, y_class_train, y_class_test):
         """
-        Train two-stage model: classification + regression
+        Train classification model (binary: delayed vs on-time)
         """
-        print("\n🚀 TRAINING TWO-STAGE MODEL")
+        print("\n🚀 TRAINING CLASSIFICATION MODEL")
         print("=" * 60)
         
-        # Stage 1: Classification Model (Will flight be delayed?) with calibration and model selection
-        print("Stage 1: Training Classification Model...")
+        print("Training Classification Model...")
         clf = self._select_classifier(X_train, y_class_train)
         self.classification_model = CalibratedClassifierCV(clf, cv=3, method='isotonic')
         self.classification_model.fit(X_train, y_class_train)
         
         # Classification predictions (with threshold tuning)
         y_class_proba = self.classification_model.predict_proba(X_test)[:, 1]
-
-        def _select_optimal_threshold(y_true, y_proba):
+        
+        def _select_threshold_for_recall(y_true, y_proba, target_recall: float = 0.80):
             precision, recall, thresholds = precision_recall_curve(y_true, y_proba)
-            # avoid division by zero
+            candidates = []
+            for idx, thr in enumerate(thresholds):
+                r = recall[idx]
+                p = precision[idx]
+                if r >= target_recall:
+                    candidates.append((p, thr))
+            if candidates:
+                _, best_thr = max(candidates, key=lambda x: x[0])
+                return float(max(0.01, min(0.99, best_thr)))
+            # Fallback to F1-optimal if no threshold meets recall target
             f1_scores = (2 * precision * recall) / (precision + recall + 1e-12)
-            # thresholds has len = len(precision)-1
             best_idx = f1_scores[:-1].argmax()
-            return max(0.01, min(0.99, thresholds[best_idx]))
-
-        selected_threshold = _select_optimal_threshold(y_class_test, y_class_proba)
+            return float(max(0.01, min(0.99, thresholds[best_idx])))
+        
+        selected_threshold = _select_threshold_for_recall(y_class_test, y_class_proba, target_recall=0.80)
         self.selected_threshold_ = selected_threshold
         y_class_pred = (y_class_proba >= selected_threshold).astype(int)
         
         print("✅ Classification model trained")
         
-        # Stage 2: Regression Model (How long will delay be?)
-        print("\nStage 2: Training Regression Model...")
-        
-        # Only train on delayed flights
-        delayed_train_mask = y_class_train == 1
-        X_train_delayed = X_train[delayed_train_mask]
-        y_reg_train_delayed = y_reg_train[delayed_train_mask]
-        
-        self.regression_model = RandomForestRegressor(
-            n_estimators=100,
-            max_depth=10,
-            random_state=42,
-            n_jobs=-1
-        )
-        
-        self.regression_model.fit(X_train_delayed, y_reg_train_delayed)
-        
-        print("✅ Regression model trained")
-        
-        # Stage 2b: Delay bucket classifier (multiclass)
-        def bucketize(v):
-            if v <= 0:
-                return 0
-            if v <= 15:
-                return 1
-            if v <= 60:
-                return 2
-            return 3
-        y_bucket_train = y_reg_train.apply(bucketize)
-        self.bucket_model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1, class_weight='balanced')
-        self.bucket_model.fit(X_train, y_bucket_train)
-        
-        # Combined predictions
-        print("\n🎯 MAKING COMBINED PREDICTIONS")
-        print("=" * 60)
-        
-        # Predict delays for all test flights
-        delay_predictions = np.zeros(len(X_test))
-        
-        # For flights predicted as delayed, predict delay duration
-        delayed_mask = y_class_pred == 1
-        if delayed_mask.sum() > 0:
-            delay_predictions[delayed_mask] = self.regression_model.predict(X_test[delayed_mask])
-        
-        # For flights predicted as on-time, delay is 0
-        delay_predictions[~delayed_mask] = 0
-        
-        # Bucket predictions
-        y_bucket_pred = self.bucket_model.predict(X_test)
-        
-        return y_class_pred, y_class_proba, delay_predictions, y_bucket_pred
+        return y_class_pred, y_class_proba
     
-    def evaluate_models(self, y_class_test, y_class_pred, y_class_proba, y_reg_test, delay_predictions, y_bucket_pred):
+    def evaluate_models(self, y_class_test, y_class_pred, y_class_proba):
         """
-        Evaluate both models
+        Evaluate classification model
         """
         print("\n📊 MODEL EVALUATION")
         print("=" * 60)
         
         # Classification evaluation
-        print("STAGE 1: CLASSIFICATION MODEL")
+        print("CLASSIFICATION MODEL")
         print("-" * 40)
         print("Classification Report:")
         print(classification_report(y_class_test, y_class_pred))
@@ -296,57 +242,99 @@ class ConsumerMLPipeline:
             print(f"ROC-AUC: {roc_auc:.3f}")
             print(f"PR-AUC: {pr_auc:.3f}")
             if hasattr(self, 'selected_threshold_'):
-                print(f"Selected threshold (F1-optimal): {self.selected_threshold_:.2f}")
+                thr = float(self.selected_threshold_)
+                y_hat = (y_class_proba >= thr).astype(int)
+                from sklearn.metrics import precision_score, recall_score
+                prec = precision_score(y_class_test, y_hat)
+                rec = recall_score(y_class_test, y_hat)
+                print(f"Selected threshold (recall-target=0.80): {thr:.2f} | Test Precision={prec:.3f}, Recall={rec:.3f}")
+
+                # Confusion matrix at chosen threshold
+                cm = confusion_matrix(y_class_test, y_hat, labels=[0,1])
+                tn, fp, fn, tp = cm.ravel()
+                print("\nConfusion Matrix (thr={:.2f}):".format(thr))
+                print("-" * 40)
+                print(f"TN={tn:,}  FP={fp:,}")
+                print(f"FN={fn:,}  TP={tp:,}")
+                # Heatmap plot
+                try:
+                    import matplotlib.pyplot as plt
+                    import numpy as np
+                    from pathlib import Path
+                    out_dir = Path(__file__).parent / 'model_quality_plots'
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    fig, ax = plt.subplots(figsize=(4.5,4))
+                    im = ax.imshow(cm, cmap='Blues')
+                    ax.set_title('Consumer - Confusion Matrix')
+                    ax.set_xlabel('Predicted')
+                    ax.set_ylabel('Actual')
+                    ax.set_xticks([0,1]); ax.set_xticklabels(['On-time','Delayed'])
+                    ax.set_yticks([0,1]); ax.set_yticklabels(['On-time','Delayed'])
+                    for (i, j), v in np.ndenumerate(cm):
+                        ax.text(j, i, f"{v:,}", ha='center', va='center', color='black')
+                    fig.tight_layout()
+                    path = out_dir / 'consumer_confusion_matrix.png'
+                    fig.savefig(path, dpi=120)
+                    try:
+                        from IPython.display import Image, display
+                        display(Image(filename=str(path)))
+                    except Exception:
+                        pass
+                    plt.close(fig)
+                    print(f"Saved confusion matrix plot: {path}")
+                except Exception:
+                    pass
+                
+                # Cost/benefit table (simple illustrative defaults)
+                cost_fp = 1.0  # false alarm cost
+                cost_fn = 10.0 # missed delay cost
+                benefit_tp = 3.0 # benefit of correctly flagging delay
+                benefit_tn = 0.0
+                total_utility = tp*benefit_tp + tn*benefit_tn - fp*cost_fp - fn*cost_fn
+                per_1k = total_utility / max(1, (tn+fp+fn+tp)) * 1000
+                print("\nCost/Benefit (illustrative):")
+                print(f"  cost_fp={cost_fp:.1f}, cost_fn={cost_fn:.1f}, benefit_tp={benefit_tp:.1f}")
+                print(f"  Total utility: {total_utility:,.1f}  (per 1000 flights: {per_1k:.1f})")
         except Exception:
             pass
         
-        # Regression evaluation (only on actually delayed flights)
-        print("\nSTAGE 2: REGRESSION MODEL")
-        print("-" * 40)
-        
-        # Only evaluate regression on flights that were actually delayed
-        actually_delayed_mask = y_reg_test > 0
-        if actually_delayed_mask.sum() > 0:
-            actual_delays = y_reg_test[actually_delayed_mask]
-            predicted_delays = delay_predictions[actually_delayed_mask]
-            
-            mae = mean_absolute_error(actual_delays, predicted_delays)
-            r2 = r2_score(actual_delays, predicted_delays)
-            
-            print(f"Regression Metrics (on actually delayed flights):")
-            print(f"  MAE: {mae:.2f} minutes")
-            print(f"  R²: {r2:.3f}")
-            print(f"  Samples: {len(actual_delays):,}")
-        
-        # Combined evaluation
-        print("\nCOMBINED MODEL PERFORMANCE")
-        print("-" * 40)
-        
-        # Overall delay prediction accuracy
-        overall_mae = mean_absolute_error(y_reg_test, delay_predictions)
-        overall_r2 = r2_score(y_reg_test, delay_predictions)
-        
-        print(f"Overall Delay Prediction:")
-        print(f"  MAE: {overall_mae:.2f} minutes")
-        print(f"  R²: {overall_r2:.3f}")
-        
         # Classification accuracy
         classification_accuracy = (y_class_pred == y_class_test).mean()
-        print(f"  Classification Accuracy: {classification_accuracy:.3f}")
-        
-        # Delay bucket evaluation (multiclass model)
-        def bucketize(v):
-            if v <= 0:
-                return 0
-            if v <= 15:
-                return 1
-            if v <= 60:
-                return 2
-            return 3
-        y_true_bucket = y_reg_test.apply(bucketize)
+        print(f"Classification Accuracy: {classification_accuracy:.3f}")
+
+        # Calibration: Brier score and reliability table (+ optional plot)
         try:
-            bucket_f1 = f1_score(y_true_bucket, y_bucket_pred, average='macro')
-            print(f"Bucketed delay macro-F1 (multiclass): {bucket_f1:.3f} (bins: 0,1-15,16-60,>60)")
+            brier = brier_score_loss(y_class_test, y_class_proba)
+            print(f"Brier score: {brier:.4f}")
+            prob_true, prob_pred = calibration_curve(y_class_test, y_class_proba, n_bins=10, strategy='uniform')
+            print("Reliability (10 bins):")
+            for i, (pp, pt) in enumerate(zip(prob_pred, prob_true), start=1):
+                print(f"  Bin {i:2d}: pred={pp:.3f} | true={pt:.3f}")
+            # Optional plot save
+            try:
+                import matplotlib.pyplot as plt
+                from pathlib import Path
+                out_dir = Path(__file__).parent / 'model_quality_plots'
+                out_dir.mkdir(parents=True, exist_ok=True)
+                plt.figure(figsize=(5,5))
+                plt.plot([0,1],[0,1], 'k--', label='Perfectly calibrated')
+                plt.plot(prob_pred, prob_true, marker='o', label='Model')
+                plt.xlabel('Predicted probability')
+                plt.ylabel('Empirical frequency')
+                plt.title('Consumer - Calibration Curve')
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(out_dir / 'consumer_calibration_curve.png', dpi=120)
+                # Show inline in notebooks
+                try:
+                    from IPython.display import Image, display
+                    display(Image(filename=str(out_dir / 'consumer_calibration_curve.png')))
+                except Exception:
+                    pass
+                plt.close()
+                print(f"Saved calibration plot: {out_dir / 'consumer_calibration_curve.png'}")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -386,12 +374,18 @@ class ConsumerMLPipeline:
                     best_model = est
             except Exception:
                 continue
+        # Persist selection details for clearer summaries
+        try:
+            self.selected_classifier_name = type(best_model).__name__
+            self.selected_classifier_pr_auc = float(best_pr_auc)
+        except Exception:
+            pass
         print(f"Selected classifier: {type(best_model).__name__} (PR-AUC val={best_pr_auc:.3f})")
         return best_model
     
     def show_feature_importance(self):
         """
-        Show feature importance for both models
+        Show feature importance for the classification model
         """
         print("\n🔍 FEATURE IMPORTANCE")
         print("=" * 60)
@@ -405,17 +399,8 @@ class ConsumerMLPipeline:
             importances = self.classification_model.feature_importances_
             for name, importance in zip(feature_names, importances):
                 print(f"  {name}: {importance:.3f}")
-        
-        # Regression feature importance
-        print("\nREGRESSION MODEL - Feature Importance:")
-        print("-" * 50)
-        
-        if hasattr(self.regression_model, 'feature_importances_'):
-            importances = self.regression_model.feature_importances_
-            for name, importance in zip(feature_names, importances):
-                print(f"  {name}: {importance:.3f}")
     
-    def create_consumer_examples(self, X_test, y_class_pred, y_class_proba, delay_predictions):
+    def create_consumer_examples(self, X_test, y_class_pred, y_class_proba):
         """
         Create examples of what a consumer would see
         """
@@ -444,7 +429,6 @@ class ConsumerMLPipeline:
             # Get predictions corresponding to the sampled position
             will_delay = y_class_pred[pos]
             delay_prob = y_class_proba[pos]
-            predicted_delay = delay_predictions[pos]
             
             # Get actual delay
             actual_delay = self.df.loc[orig_idx, 'DepDelayMinutes']
@@ -454,8 +438,6 @@ class ConsumerMLPipeline:
             print(f"  Time: {hour:02d}:00, {day}, {season}")
             print(f"  Prediction: {'Will be delayed' if will_delay else 'On time'}")
             print(f"  Delay probability: {delay_prob:.1%}")
-            if will_delay:
-                print(f"  Predicted delay: {predicted_delay:.1f} minutes")
             print(f"  Actual delay: {actual_delay:.1f} minutes")
     
     def run_complete_pipeline(self):
@@ -473,39 +455,115 @@ class ConsumerMLPipeline:
         self.create_consumer_features()
         
         # Prepare dataset
-        X, y_class, y_reg, feature_names = self.prepare_consumer_dataset()
+        X, y_class, feature_names = self.prepare_consumer_dataset()
         
         # Create splits
-        X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test = self.create_time_based_splits(
-            X, y_class, y_reg
+        X_train, X_test, y_class_train, y_class_test = self.create_time_based_splits(
+            X, y_class
         )
         
-        # Train models
-        y_class_pred, y_class_proba, delay_predictions, y_bucket_pred = self.train_two_stage_model(
-            X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test
+        # Train model
+        y_class_pred, y_class_proba = self.train_classification_model(
+            X_train, X_test, y_class_train, y_class_test
         )
         
-        # Evaluate models
-        self.evaluate_models(y_class_test, y_class_pred, y_class_proba, y_reg_test, delay_predictions, y_bucket_pred)
+        # Evaluate model
+        self.evaluate_models(y_class_test, y_class_pred, y_class_proba)
         
         # Show feature importance
         self.show_feature_importance()
         
         # Create consumer examples
-        self.create_consumer_examples(X_test, y_class_pred, y_class_proba, delay_predictions)
+        self.create_consumer_examples(X_test, y_class_pred, y_class_proba)
         
+        # Clear summary of selected model
+        model_name = getattr(self, 'selected_classifier_name', type(self.classification_model).__name__)
         print("\n🎯 CONSUMER ML PIPELINE COMPLETE!")
         print("=" * 70)
-        print("✅ Two-stage model trained (Classification + Regression)")
+        print(f"📌 Selected classifier: {model_name}")
+        if hasattr(self, 'selected_threshold_'):
+            print(f"📌 Selected decision threshold: {self.selected_threshold_:.2f}")
+        if hasattr(self, 'selected_classifier_pr_auc'):
+            print(f"📌 Validation PR-AUC (selection): {self.selected_classifier_pr_auc:.3f}")
         print("✅ Consumer-visible features only")
         print("✅ Ready for consumer-facing application!")
         
         return {
             'classification_model': self.classification_model,
-            'regression_model': self.regression_model,
             'feature_encoders': self.feature_encoders,
             'feature_names': feature_names
         }
+
+    def evaluate_with_rolling_time_cv(self):
+        """
+        Rolling year-based validation using only pre-COVID years for training and
+        later years for validation. Folds:
+          - Train: [2018] -> Val: [2019]
+          - Train: [2018,2019] -> Val: [2022]
+          - Train: [2018,2019,2022] -> Val: [2023]
+        """
+        if 'Year' not in self.df.columns:
+            return
+        folds = [
+            ([2018], [2019]),
+            ([2018, 2019], [2022]),
+            ([2018, 2019, 2022], [2023])
+        ]
+        results = []
+        for train_years, val_years in folds:
+            if not set(val_years).issubset(set(self.df['Year'].unique())):
+                continue
+            train_mask = self.df['Year'].isin(train_years)
+            val_mask = self.df['Year'].isin(val_years)
+            # Recompute leakage-safe priors from train split
+            self._add_leakage_safe_priors(train_mask)
+            priors = [
+                col for col in ['RouteAvgDelay_Prior', 'OriginAvgDelay_Prior', 'OriginHourTraffic_Prior']
+                if col in self.df.columns
+            ]
+            base_features = [col for col in self.df.columns if col.endswith('_Encoded') or col in ['HourOfDay', 'DayOfWeek']]
+            feature_cols = list(dict.fromkeys(base_features + priors))
+            X_tr = self.df.loc[train_mask, feature_cols].fillna(0)
+            X_va = self.df.loc[val_mask, feature_cols].fillna(0)
+            y_tr = self.df.loc[train_mask, 'IsDelayed']
+            y_va = self.df.loc[val_mask, 'IsDelayed']
+            # Train calibrated classifier
+            clf = self._select_classifier(X_tr, y_tr)
+            calibrated = CalibratedClassifierCV(clf, cv=3, method='isotonic')
+            calibrated.fit(X_tr, y_tr)
+            proba = calibrated.predict_proba(X_va)[:, 1]
+            # Threshold for recall target
+            precision, recall, thresholds = precision_recall_curve(y_va, proba)
+            target_recall = 0.80
+            candidates = []
+            for idx, thr in enumerate(thresholds):
+                r = recall[idx]
+                p = precision[idx]
+                if r >= target_recall:
+                    candidates.append((p, thr))
+            if candidates:
+                _, thr = max(candidates, key=lambda x: x[0])
+            else:
+                f1_scores = (2 * precision * recall) / (precision + recall + 1e-12)
+                best_idx = f1_scores[:-1].argmax()
+                thr = thresholds[best_idx]
+            y_hat = (proba >= float(thr)).astype(int)
+            from sklearn.metrics import precision_score, recall_score
+            fold_prec = precision_score(y_va, y_hat)
+            fold_rec = recall_score(y_va, y_hat)
+            fold_pr_auc = average_precision_score(y_va, proba)
+            fold_roc_auc = roc_auc_score(y_va, proba)
+            results.append((train_years, val_years, fold_prec, fold_rec, fold_pr_auc, fold_roc_auc))
+        if results:
+            print("\n🧪 ROLLING TIME VALIDATION (Consumer)")
+            print("=" * 60)
+            for tr, va, p, r, pr, roc in results:
+                print(f"Train {tr} -> Val {va} | Precision={p:.3f}, Recall={r:.3f}, PR-AUC={pr:.3f}, ROC-AUC={roc:.3f}")
+            avg_p = sum(x[2] for x in results) / len(results)
+            avg_r = sum(x[3] for x in results) / len(results)
+            avg_pr = sum(x[4] for x in results) / len(results)
+            avg_roc = sum(x[5] for x in results) / len(results)
+            print(f"Avg | Precision={avg_p:.3f}, Recall={avg_r:.3f}, PR-AUC={avg_pr:.3f}, ROC-AUC={avg_roc:.3f}")
 
 def main():
     """
@@ -517,7 +575,6 @@ def main():
     if models:
         print(f"\n📊 FINAL MODEL SUMMARY:")
         print(f"Classification model: {type(models['classification_model']).__name__}")
-        print(f"Regression model: {type(models['regression_model']).__name__}")
         print(f"Features: {len(models['feature_names'])}")
         print(f"Consumer-visible features: Origin, Destination, Time, Day, Season")
 
