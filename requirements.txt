@@ -1,0 +1,16 @@
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+matplotlib>=3.8
+seaborn>=0.13
+plotly>=5.20
+statsmodels>=0.14
+scikit-learn>=1.4
+# Optional gradient boosting (pipelines will use if available)
+lightgbm>=4.1
+xgboost>=2.0
+catboost>=1.2
+# Notebook support
+jupyter>=1.0
+ipykernel>=6.29
+

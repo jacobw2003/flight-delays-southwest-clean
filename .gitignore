@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+.DS_Store
+.env
+catboost_info/
+
+# Ignore entire data directory (datasets are too large)
+data/**/*.csv
+data/**/*.parquet
+
+# Ignore generated analysis/model plots
+analysis/**/analysis_plots/
+analysis/**/model_testing_plots/
+analysis/**/covid_analysis_plots/
+
+# Jupyter checkpoints
+**/.ipynb_checkpoints/
